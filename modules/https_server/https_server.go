@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bettercap/bettercap/session"
-	"github.com/bettercap/bettercap/tls"
+	"github.com/bettercap/bettercap/v2/session"
+	"github.com/bettercap/bettercap/v2/tls"
 
 	"github.com/evilsocket/islazy/fs"
 	"github.com/evilsocket/islazy/tui"
@@ -35,11 +35,11 @@ func NewHttpsServer(s *session.Session) *HttpsServer {
 	mod.AddParam(session.NewStringParameter("https.server.address",
 		session.ParamIfaceAddress,
 		session.IPv4Validator,
-		"Address to bind the http server to."))
+		"Address to bind the HTTPS server to."))
 
 	mod.AddParam(session.NewIntParameter("https.server.port",
 		"443",
-		"Port to bind the http server to."))
+		"Port to bind the HTTPS server to."))
 
 	mod.AddParam(session.NewStringParameter("https.server.certificate",
 		"~/.bettercap-httpd.cert.pem",
@@ -54,13 +54,13 @@ func NewHttpsServer(s *session.Session) *HttpsServer {
 	tls.CertConfigToModule("https.server", &mod.SessionModule, tls.DefaultLegitConfig)
 
 	mod.AddHandler(session.NewModuleHandler("https.server on", "",
-		"Start https server.",
+		"Start HTTPS server.",
 		func(args []string) error {
 			return mod.Start()
 		}))
 
 	mod.AddHandler(session.NewModuleHandler("https.server off", "",
-		"Stop https server.",
+		"Stop HTTPS server.",
 		func(args []string) error {
 			return mod.Stop()
 		}))

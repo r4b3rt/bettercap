@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bettercap/bettercap/session"
-	"github.com/bettercap/bettercap/tls"
+	"github.com/bettercap/bettercap/v2/session"
+	"github.com/bettercap/bettercap/v2/tls"
 
 	"github.com/bettercap/recording"
 
@@ -90,12 +90,12 @@ func NewRestAPI(s *session.Session) *RestAPI {
 		"Value of the Access-Control-Allow-Origin header of the API server."))
 
 	mod.AddParam(session.NewStringParameter("api.rest.username",
-		"",
+		"user",
 		"",
 		"API authentication username."))
 
 	mod.AddParam(session.NewStringParameter("api.rest.password",
-		"",
+		"pass",
 		"",
 		"API authentication password."))
 
@@ -230,6 +230,7 @@ func (mod *RestAPI) Configure() error {
 		}
 	}
 
+	mod.server = &http.Server{}
 	mod.server.Addr = fmt.Sprintf("%s:%d", ip, port)
 
 	router := mux.NewRouter()

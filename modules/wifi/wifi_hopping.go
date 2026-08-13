@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/bettercap/bettercap/network"
+	"github.com/bettercap/bettercap/v2/network"
 )
 
 func (mod *WiFiModule) isInterfaceConnected() bool {
@@ -35,6 +35,8 @@ func (mod *WiFiModule) hopUnlocked(channel int) (mustStop bool) {
 			mod.Warning("error while hopping to channel %d: %s", channel, err)
 		}
 	}
+
+	mod.State.Store("channel", channel)
 
 	return
 }

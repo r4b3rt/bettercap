@@ -12,12 +12,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bettercap/bettercap/core"
-	"github.com/bettercap/bettercap/network"
+	"github.com/bettercap/bettercap/v2/core"
+	"github.com/bettercap/bettercap/v2/log"
+	"github.com/bettercap/bettercap/v2/network"
 
 	"github.com/bettercap/readline"
 	"github.com/evilsocket/islazy/str"
 	"github.com/evilsocket/islazy/tui"
+
+	"github.com/robertkrimen/otto"
 )
 
 func (s *Session) generalHelp() {
@@ -155,6 +158,14 @@ func (s *Session) activeHandler(args []string, sess *Session) error {
 }
 
 func (s *Session) exitHandler(args []string, sess *Session) error {
+	if s.script != nil {
+		if s.script.Plugin.HasFunc("onExit") {
+			if _, err := s.script.Plugin.Call("onExit"); err != nil {
+				log.Error("Error while executing onExit callback: %s", "\nTraceback:\n  "+err.(*otto.Error).String())
+			}
+		}
+	}
+
 	// notify any listener that the session is about to end
 	s.Events.Add("session.stopped", nil)
 
@@ -307,11 +318,11 @@ func (s *Session) propagateAlias(mac, alias string) {
 	}
 
 	if ap, found := s.WiFi.Get(mac); found {
-		ap.Alias = alias
+		ap.SetAlias(alias)
 	}
 
 	if sta, found := s.WiFi.GetClient(mac); found {
-		sta.Alias = alias
+		sta.SetAlias(alias)
 	}
 
 	if host, found := s.Lan.Get(mac); found {

@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bettercap/bettercap/firewall"
-	"github.com/bettercap/bettercap/session"
-	btls "github.com/bettercap/bettercap/tls"
+	"github.com/bettercap/bettercap/v2/firewall"
+	"github.com/bettercap/bettercap/v2/session"
+	btls "github.com/bettercap/bettercap/v2/tls"
 
 	"github.com/elazarl/goproxy"
 	"github.com/inconshreveable/go-vhost"
@@ -27,6 +27,8 @@ import (
 	"github.com/evilsocket/islazy/log"
 	"github.com/evilsocket/islazy/str"
 	"github.com/evilsocket/islazy/tui"
+
+	"github.com/robertkrimen/otto"
 )
 
 const (
@@ -175,7 +177,7 @@ func (p *HTTPProxy) Configure(address string, proxyPort int, httpPort int, doRed
 
 	// check if another http(s) proxy is using sslstrip and merge strippers
 	if stripSSL {
-		for _, mname := range []string{"http.proxy", "https.proxy"}{
+		for _, mname := range []string{"http.proxy", "https.proxy"} {
 			err, m := p.Sess.Module(mname)
 			if err == nil && m.Running() {
 				var mextra interface{}
@@ -432,6 +434,14 @@ func (p *HTTPProxy) Start() {
 }
 
 func (p *HTTPProxy) Stop() error {
+	if p.Script != nil {
+		if p.Script.Plugin.HasFunc("onExit") {
+			if _, err := p.Script.Call("onExit"); err != nil {
+				log.Error("Error while executing onExit callback: %s", "\nTraceback:\n  "+err.(*otto.Error).String())
+			}
+		}
+	}
+
 	if p.doRedirect && p.Redirection != nil {
 		p.Debug("disabling redirection %s", p.Redirection.String())
 		if err := p.Sess.Firewall.EnableRedirection(p.Redirection, false); err != nil {

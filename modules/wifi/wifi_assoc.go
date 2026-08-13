@@ -1,23 +1,22 @@
 package wifi
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"sort"
 
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/packets"
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/packets"
 )
 
-func (mod *WiFiModule) sendAssocPacket(ap *network.AccessPoint) {
+func (mod *WiFiModule) sendAssocPacket(ap network.StationSnapshot) {
 	if err, pkt := packets.NewDot11Auth(mod.iface.HW, ap.HW, 1); err != nil {
 		mod.Error("cloud not create auth packet: %s", err)
 	} else {
 		mod.injectPacket(pkt)
 	}
 
-	if err, pkt := packets.NewDot11AssociationRequest(mod.iface.HW, ap.HW, ap.ESSID(), 1); err != nil {
+	if err, pkt := packets.NewDot11AssociationRequest(mod.iface.HW, ap.HW, ap.Hostname, 1); err != nil {
 		mod.Error("cloud not create association request packet: %s", err)
 	} else {
 		mod.injectPacket(pkt)
@@ -25,12 +24,7 @@ func (mod *WiFiModule) sendAssocPacket(ap *network.AccessPoint) {
 }
 
 func (mod *WiFiModule) skipAssoc(to net.HardwareAddr) bool {
-	for _, mac := range mod.assocSkip {
-		if bytes.Equal(to, mac) {
-			return true
-		}
-	}
-	return false
+	return hardwareAddrIn(mod.assocSkip, to)
 }
 
 func (mod *WiFiModule) isAssocSilent() bool {
@@ -60,14 +54,33 @@ func (mod *WiFiModule) doAssocAcquired() bool {
 	return mod.assocAcquired
 }
 
-func (mod *WiFiModule) startAssoc(to net.HardwareAddr) error {
-	// parse skip list
-	if err, assocSkip := mod.StringParam("wifi.assoc.skip"); err != nil {
+func (mod *WiFiModule) assocTargetsFor(selector wifiSelector) []wifiTarget {
+	toAssoc := make([]wifiTarget, 0)
+	for _, target := range mod.resolveWiFiTargets(selector, false) {
+		if !mod.skipAssoc(target.apSnapshot.HW) {
+			toAssoc = append(toAssoc, target)
+		} else {
+			mod.Debug("skipping ap:%v because skip list %v", target.ap, mod.assocSkip)
+		}
+	}
+	return toAssoc
+}
+
+func (mod *WiFiModule) assocCompleter(prefix string) []string {
+	return mod.wifiTargetCompleter(prefix, false)
+}
+
+func (mod *WiFiModule) startAssoc(target string) error {
+	selector, err := newWiFiSelector(target)
+	if err != nil {
 		return err
-	} else if macs, err := network.ParseMACs(assocSkip); err != nil {
+	}
+
+	// parse skip list
+	if assocSkip, err := mod.parseWiFiSkipList("wifi.assoc.skip"); err != nil {
 		return err
 	} else {
-		mod.assocSkip = macs
+		mod.assocSkip = assocSkip
 	}
 
 	// if not already running, temporarily enable the pcap handle
@@ -79,23 +92,13 @@ func (mod *WiFiModule) startAssoc(to net.HardwareAddr) error {
 		defer mod.handle.Close()
 	}
 
-	toAssoc := make([]*network.AccessPoint, 0)
-	isBcast := network.IsBroadcastMac(to)
-	for _, ap := range mod.Session.WiFi.List() {
-		if isBcast || bytes.Equal(ap.HW, to) {
-			if !mod.skipAssoc(ap.HW) {
-				toAssoc = append(toAssoc, ap)
-			} else {
-				mod.Debug("skipping ap:%v because skip list %v", ap, mod.assocSkip)
-			}
-		}
-	}
+	toAssoc := mod.assocTargetsFor(selector)
 
 	if len(toAssoc) == 0 {
-		if isBcast {
+		if selector.all {
 			return nil
 		}
-		return fmt.Errorf("%s is an unknown BSSID or it is in the association skip list.", to.String())
+		return fmt.Errorf("%q is an unknown BSSID or ESSID, or it is in the association skip list", selector.raw)
 	}
 	mod.writes.Add(1)
 	go func() {
@@ -105,26 +108,28 @@ func (mod *WiFiModule) startAssoc(to net.HardwareAddr) error {
 		// association request, let's sort by channel so we do the minimum
 		// amount of hops possible
 		sort.Slice(toAssoc, func(i, j int) bool {
-			return toAssoc[i].Channel < toAssoc[j].Channel
+			return toAssoc[i].apSnapshot.Channel < toAssoc[j].apSnapshot.Channel
 		})
 
 		// send the association request frames
-		for _, ap := range toAssoc {
+		for _, target := range toAssoc {
 			if mod.Running() {
+				ap := target.ap
+				snapshot := target.apSnapshot
 				logger := mod.Info
 				if mod.isAssocSilent() {
 					logger = mod.Debug
 				}
 
-				if ap.IsOpen() && !mod.doAssocOpen() {
-					mod.Debug("skipping association for open network %s (wifi.assoc.open is false)", ap.ESSID())
+				if (snapshot.Encryption == "" || snapshot.Encryption == "OPEN") && !mod.doAssocOpen() {
+					mod.Debug("skipping association for open network %s (wifi.assoc.open is false)", snapshot.Hostname)
 				} else if ap.HasKeyMaterial() && !mod.doAssocAcquired() {
-					mod.Debug("skipping association for AP %s (key material already acquired)", ap.ESSID())
+					mod.Debug("skipping association for AP %s (key material already acquired)", snapshot.Hostname)
 				} else {
-					logger("sending association request to AP %s (channel:%d encryption:%s)", ap.ESSID(), ap.Channel, ap.Encryption)
+					logger("sending association request to AP %s (channel:%d encryption:%s)", snapshot.Hostname, snapshot.Channel, snapshot.Encryption)
 
-					mod.onChannel(ap.Channel, func() {
-						mod.sendAssocPacket(ap)
+					mod.onChannel(snapshot.Channel, func() {
+						mod.sendAssocPacket(snapshot)
 					})
 				}
 			}

@@ -2,21 +2,24 @@ package wifi
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/bettercap/bettercap/modules/utils"
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/packets"
-	"github.com/bettercap/bettercap/session"
+	"github.com/bettercap/bettercap/v2/modules/utils"
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/packets"
+	"github.com/bettercap/bettercap/v2/session"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
 
 	"github.com/evilsocket/islazy/fs"
 	"github.com/evilsocket/islazy/ops"
@@ -27,6 +30,7 @@ type WiFiModule struct {
 	session.SessionModule
 
 	iface               *network.Endpoint
+	bruteforce          *bruteforceConfig
 	handle              *pcap.Handle
 	source              string
 	region              string
@@ -71,13 +75,14 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 	mod := &WiFiModule{
 		SessionModule:   session.NewSessionModule("wifi", s),
 		iface:           s.Interface,
+		bruteforce:      NewBruteForceConfig(),
 		minRSSI:         -200,
 		apTTL:           300,
 		staTTL:          300,
 		channel:         0,
 		stickChan:       0,
 		hopPeriod:       250 * time.Millisecond,
-		hopChanges:      make(chan bool),
+		hopChanges:      make(chan bool, 1),
 		ap:              nil,
 		skipBroken:      true,
 		apRunning:       false,
@@ -99,6 +104,10 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 	}
 
 	mod.InitState("channels")
+	mod.InitState("channel")
+
+	mod.State.Store("channels", []int{})
+	mod.State.Store("channel", 0)
 
 	mod.AddParam(session.NewStringParameter("wifi.interface",
 		"",
@@ -117,6 +126,44 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 			return mod.Stop()
 		}))
 
+	mod.AddParam(session.NewStringParameter("wifi.bruteforce.target",
+		mod.bruteforce.target,
+		"",
+		"One or more comma separated targets to bruteforce as ESSID or BSSID. Leave empty to bruteforce all visibile access points."))
+
+	mod.AddParam(session.NewStringParameter("wifi.bruteforce.wordlist",
+		mod.bruteforce.wordlist,
+		"",
+		"Wordlist file to use for bruteforcing."))
+
+	mod.AddParam(session.NewIntParameter("wifi.bruteforce.workers",
+		fmt.Sprintf("%d", mod.bruteforce.workers),
+		"How many parallel workers. WARNING: Some routers will ban multiple concurrent attempts."))
+
+	mod.AddParam(session.NewBoolParameter("wifi.bruteforce.wide",
+		fmt.Sprintf("%v", mod.bruteforce.wide),
+		"Attempt a password for each access point before moving to the next one."))
+
+	mod.AddParam(session.NewBoolParameter("wifi.bruteforce.stop_at_first",
+		fmt.Sprintf("%v", mod.bruteforce.stop_at_first),
+		"Stop bruteforcing after the first successful attempt."))
+
+	mod.AddParam(session.NewIntParameter("wifi.bruteforce.timeout",
+		fmt.Sprintf("%d", mod.bruteforce.timeout),
+		"Timeout in seconds for each association attempt."))
+
+	mod.AddHandler(session.NewModuleHandler("wifi.bruteforce on", "",
+		"Attempts to bruteforce WiFi authentication.",
+		func(args []string) error {
+			return mod.startBruteforce()
+		}))
+
+	mod.AddHandler(session.NewModuleHandler("wifi.bruteforce off", "",
+		"Stop previously started bruteforcing.",
+		func(args []string) error {
+			return mod.stopBruteforce()
+		}))
+
 	mod.AddHandler(session.NewModuleHandler("wifi.clear", "",
 		"Clear all access points collected by the WiFi discovery module.",
 		func(args []string) error {
@@ -132,10 +179,10 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 				return err
 			} else if ap, found := mod.Session.WiFi.Get(bssid.String()); found {
 				mod.ap = ap
-				mod.stickChan = ap.Channel
+				mod.stickChan = ap.Snapshot().Channel
 				return nil
 			}
-			return fmt.Errorf("Could not find station with BSSID %s", args[0])
+			return fmt.Errorf("could not find station with BSSID %s", args[0])
 		}))
 
 	mod.AddHandler(session.NewModuleHandler("wifi.recon clear", "",
@@ -143,9 +190,36 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 		func(args []string) (err error) {
 			mod.ap = nil
 			mod.stickChan = 0
+			// same nil-check wifi.recon.channel clear already has just above --
+			// this handler can run before the module's own iface is set (e.g.
+			// pwnagotchi calling it at the very start of a recon cycle, right
+			// after (re)connecting, before wifi.recon on has actually started
+			// the module) and mod.iface.Name() on a nil iface is a crash, not
+			// a graceful error, without this check
+			if mod.iface == nil {
+				return fmt.Errorf("wifi.interface not set or not found")
+			}
 			freqs, err := network.GetSupportedFrequencies(mod.iface.Name())
 			mod.setFrequencies(freqs)
-			mod.hopChanges <- true
+			// hopChanges is a "recompute now instead of waiting for your next
+			// per-channel timeout" nudge to channelHopper(). A plain blocking
+			// send here deadlocks forever (taking the whole session's
+			// command-execution lock down with it, since this handler runs
+			// under Session.Run()'s mutex) whenever the hopper goroutine
+			// isn't in its select case at this exact instant -- confirmed
+			// live: reliably within 1-2 epochs of a caller (e.g. pwnagotchi)
+			// that calls wifi.recon clear on every single cycle. The
+			// non-blocking send keeps that safe; the buffer of 1 (rather
+			// than unbuffered) means a nudge that arrives while the hopper
+			// is transiently busy elsewhere still gets queued and picked up
+			// as soon as it re-enters the select, instead of being silently
+			// dropped and relying solely on the hopper's own
+			// time.After(delay) fallback to notice the change up to one hop
+			// period later.
+			select {
+			case mod.hopChanges <- true:
+			default:
+			}
 			return err
 		}))
 
@@ -187,20 +261,13 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 		}
 	})
 
-	deauth := session.NewModuleHandler("wifi.deauth BSSID", `wifi\.deauth ((?:[a-fA-F0-9:]{11,})|all|\*)`,
-		"Start a 802.11 deauth attack, if an access point BSSID is provided, every client will be deauthenticated, otherwise only the selected client. Use 'all', '*' or a broadcast BSSID (ff:ff:ff:ff:ff:ff) to iterate every access point with at least one client and start a deauth attack for each one.",
+	deauth := session.NewModuleHandler("wifi.deauth BSSID", `^wifi\.deauth\s+(.+)$`,
+		"Start an 802.11 deauth attack. The argument can be a client or AP BSSID, an exact ESSID, a case-sensitive ESSID wildcard expression such as 'Corp*', 'all', '*', or the broadcast BSSID. ESSID targets apply to every visible AP with a matching name.",
 		func(args []string) error {
-			if args[0] == "all" || args[0] == "*" {
-				args[0] = "ff:ff:ff:ff:ff:ff"
-			}
-			bssid, err := net.ParseMAC(args[0])
-			if err != nil {
-				return err
-			}
-			return mod.startDeauth(bssid)
+			return mod.startDeauth(args[0])
 		})
 
-	deauth.Complete("wifi.deauth", s.WiFiCompleterFull)
+	deauth.Complete("wifi.deauth", mod.deauthCompleter)
 
 	mod.AddHandler(deauth)
 
@@ -218,8 +285,8 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 
 	mod.AddHandler(probe)
 
-	channelSwitchAnnounce := session.NewModuleHandler("wifi.channel_switch_announce bssid channel ", `wifi\.channel_switch_announce ((?:[a-fA-F0-9:]{11,}))\s+((?:[0-9]+))`,
-		"Start a 802.11 channel hop attack, all client will be force to change the channel lead to connection down.",
+	channelSwitchAnnounce := session.NewModuleHandler("wifi.channel_switch_announce BSSID CHANNEL ", `wifi\.channel_switch_announce ((?:[a-fA-F0-9:]{11,}))\s+((?:[0-9]+))`,
+		"Start a 802.11 channel hop attack, all client will be forced to change the channel lead to connection down.",
 		func(args []string) error {
 			bssid, err := net.ParseMAC(args[0])
 			if err != nil {
@@ -279,20 +346,13 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 		"false",
 		"Send wifi deauth packets from AP's for which key material was already acquired."))
 
-	assoc := session.NewModuleHandler("wifi.assoc BSSID", `wifi\.assoc ((?:[a-fA-F0-9:]{11,})|all|\*)`,
-		"Send an association request to the selected BSSID in order to receive a RSN PMKID key. Use 'all', '*' or a broadcast BSSID (ff:ff:ff:ff:ff:ff) to iterate for every access point.",
+	assoc := session.NewModuleHandler("wifi.assoc BSSID", `^wifi\.assoc\s+(.+)$`,
+		"Send an association request to receive an RSN PMKID key. The argument can be an AP BSSID, an exact ESSID, a case-sensitive ESSID wildcard expression such as 'Corp*', 'all', '*', or the broadcast BSSID. ESSID targets apply to every visible AP with a matching name.",
 		func(args []string) error {
-			if args[0] == "all" || args[0] == "*" {
-				args[0] = "ff:ff:ff:ff:ff:ff"
-			}
-			bssid, err := net.ParseMAC(args[0])
-			if err != nil {
-				return err
-			}
-			return mod.startAssoc(bssid)
+			return mod.startAssoc(args[0])
 		})
 
-	assoc.Complete("wifi.assoc", s.WiFiCompleter)
+	assoc.Complete("wifi.assoc", mod.assocCompleter)
 
 	mod.AddHandler(assoc)
 
@@ -418,7 +478,7 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 						return err
 					} else {
 						if f := network.Dot11Chan2Freq(ch); f == 0 {
-							return fmt.Errorf("%d is not a valid wifi channel.", ch)
+							return fmt.Errorf("%d is not a valid wifi channel", ch)
 						} else {
 							freqs = append(freqs, f)
 						}
@@ -437,9 +497,17 @@ func NewWiFiModule(s *session.Session) *WiFiModule {
 
 			mod.setFrequencies(freqs)
 
-			// if wifi.recon is not running, this would block forever
+			// mod.Running() guards the "recon never started" case, but not
+			// the hopper goroutine being transiently busy elsewhere (e.g.
+			// mid channel-change) while genuinely running -- same deadlock
+			// risk as wifi.recon clear above, same fix: non-blocking send
+			// into a buffer-of-1 channel (see that comment for the full
+			// writeup).
 			if mod.Running() {
-				mod.hopChanges <- true
+				select {
+				case mod.hopChanges <- true:
+				default:
+				}
 			}
 
 			return nil
@@ -482,11 +550,29 @@ const (
 func (mod *WiFiModule) setFrequencies(freqs []int) {
 	mod.Debug("new frequencies: %v", freqs)
 
-	mod.frequencies = freqs
+	valid_freqs := []int{}
 	channels := []int{}
 	for _, freq := range freqs {
-		channels = append(channels, network.Dot11Freq2Chan(freq))
+		// Some devices support frequencies that don't correspond to valid WiFi channels.
+		// While interesting, they are unlikely to be useful to us.
+		channel := network.Dot11Freq2Chan(freq)
+		if channel == 0 || freq != network.Dot11Chan2Freq(channel) {
+			continue
+		}
+
+		if !slices.Contains(channels, channel) {
+			valid_freqs = append(valid_freqs, freq)
+			channels = append(channels, channel)
+		}
 	}
+
+	if len(valid_freqs) < len(freqs) {
+		mod.Debug("valid frequencies: %v", valid_freqs)
+	}
+	mod.frequencies = valid_freqs
+
+	sort.Ints(channels)
+
 	mod.State.Store("channels", channels)
 
 	mod.Info("channels: %v", channels)
@@ -580,9 +666,9 @@ func (mod *WiFiModule) Configure() error {
 				// second fatal error, just bail
 				return fmt.Errorf("error while activating handle: %s", err)
 			} else {
-				// first fatal error, forcing monitor mode 
+				// first fatal error, forcing monitor mode
 				// https://github.com/bettercap/bettercap/issues/819
-				opts.Monitor = false;
+				opts.Monitor = false
 				if err := network.ForceMonitorMode(ifName); err != nil {
 					return err
 				}
@@ -599,19 +685,22 @@ func (mod *WiFiModule) Configure() error {
 	mod.hopPeriod = time.Duration(hopPeriod) * time.Millisecond
 
 	if mod.source == "" {
-		if freqs, err := network.GetSupportedFrequencies(ifName); err != nil {
-			return fmt.Errorf("error while getting supported frequencies of %s: %s", ifName, err)
-		} else {
-			mod.setFrequencies(freqs)
-		}
+		if len(mod.frequencies) == 0 {
+			if freqs, err := network.GetSupportedFrequencies(ifName); err != nil {
+				return fmt.Errorf("error while getting supported frequencies of %s: %s", ifName, err)
+			} else {
+				mod.setFrequencies(freqs)
+			}
 
-		mod.Debug("wifi supported frequencies: %v", mod.frequencies)
+			mod.Debug("wifi supported frequencies: %v", mod.frequencies)
+		}
 
 		// we need to start somewhere, this is just to check if
 		// this OS supports switching channel programmatically.
 		if err = network.SetInterfaceChannel(ifName, 1); err != nil {
 			return fmt.Errorf("error while initializing %s to channel 1: %s", ifName, err)
 		}
+		mod.State.Store("channel", 1)
 
 		mod.Info("started (min rssi: %d dBm)", mod.minRSSI)
 	}
@@ -628,17 +717,15 @@ func (mod *WiFiModule) updateInfo(dot11 *layers.Dot11, packet gopacket.Packet) {
 			// makes stations with encryption enabled switch to OPEN.
 			// Prevent this behaviour by not downgrading the encryption.
 			bssid := dot11.Address3.String()
-			if station, found := mod.Session.WiFi.Get(bssid); found && station.IsOpen() {
-				station.Encryption = enc
-				station.Cipher = cipher
-				station.Authentication = auth
+			if station, found := mod.Session.WiFi.Get(bssid); found {
+				station.SetEncryptionIfOpen(enc, cipher, auth)
 			}
 		}
 
 		if ok, bssid, info := packets.Dot11ParseWPS(packet, dot11); ok {
 			if station, found := mod.Session.WiFi.Get(bssid.String()); found {
 				for name, value := range info {
-					station.WPS[name] = value
+					station.SetWPS(name, value)
 				}
 			}
 		}
@@ -652,24 +739,30 @@ func (mod *WiFiModule) updateStats(dot11 *layers.Dot11, packet gopacket.Packet) 
 
 		dst := dot11.Address1.String()
 		if ap, found := mod.Session.WiFi.Get(dst); found {
-			ap.Received += bytes
+			ap.AddTraffic(0, bytes)
 		} else if sta, found := mod.Session.WiFi.GetClient(dst); found {
-			sta.Received += bytes
+			sta.AddTraffic(0, bytes)
 		}
 
 		src := dot11.Address2.String()
 		if ap, found := mod.Session.WiFi.Get(src); found {
-			ap.Sent += bytes
+			ap.AddTraffic(bytes, 0)
 		} else if sta, found := mod.Session.WiFi.GetClient(src); found {
-			sta.Sent += bytes
+			sta.AddTraffic(bytes, 0)
 		}
 	}
 }
 
+const wifiPrompt = "{by}{fb}{env.iface.name} {reset} {bold}» {reset}"
+
 func (mod *WiFiModule) Start() error {
-	if err := mod.Configure(); err != nil {
+	if mod.bruteforce.running.Load() {
+		return errors.New("stop wifi.bruteforce first")
+	} else if err := mod.Configure(); err != nil {
 		return err
 	}
+
+	mod.SetPrompt(wifiPrompt)
 
 	mod.SetRunning(true, func() {
 		// start channel hopper if needed
@@ -721,6 +814,8 @@ func (mod *WiFiModule) Start() error {
 }
 
 func (mod *WiFiModule) forcedStop() error {
+	mod.SetPrompt(session.DefaultPromptMonitor)
+
 	return mod.SetRunning(false, func() {
 		// signal the main for loop we want to exit
 		if !mod.pktSourceChanClosed {
@@ -732,6 +827,8 @@ func (mod *WiFiModule) forcedStop() error {
 }
 
 func (mod *WiFiModule) Stop() error {
+	mod.SetPrompt(session.DefaultPromptMonitor)
+
 	return mod.SetRunning(false, func() {
 		// wait any pending write operation
 		mod.writes.Wait()

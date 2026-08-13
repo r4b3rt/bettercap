@@ -1,13 +1,11 @@
 package wifi
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"sort"
 
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/packets"
+	"github.com/bettercap/bettercap/v2/packets"
 )
 
 func (mod *WiFiModule) sendDeauthPacket(ap net.HardwareAddr, client net.HardwareAddr) {
@@ -29,12 +27,7 @@ func (mod *WiFiModule) sendDeauthPacket(ap net.HardwareAddr, client net.Hardware
 }
 
 func (mod *WiFiModule) skipDeauth(to net.HardwareAddr) bool {
-	for _, mac := range mod.deauthSkip {
-		if bytes.Equal(to, mac) {
-			return true
-		}
-	}
-	return false
+	return hardwareAddrIn(mod.deauthSkip, to)
 }
 
 func (mod *WiFiModule) isDeauthSilent() bool {
@@ -64,14 +57,33 @@ func (mod *WiFiModule) doDeauthAcquired() bool {
 	return mod.deauthAcquired
 }
 
-func (mod *WiFiModule) startDeauth(to net.HardwareAddr) error {
-	// parse skip list
-	if err, deauthSkip := mod.StringParam("wifi.deauth.skip"); err != nil {
+func (mod *WiFiModule) deauthFlowsFor(selector wifiSelector) []wifiTarget {
+	toDeauth := make([]wifiTarget, 0)
+	for _, target := range mod.resolveWiFiTargets(selector, true) {
+		if !mod.skipDeauth(target.apSnapshot.HW) && !mod.skipDeauth(target.clientSnapshot.HW) {
+			toDeauth = append(toDeauth, target)
+		} else {
+			mod.Debug("skipping ap:%v client:%v because skip list %v", target.ap, target.client, mod.deauthSkip)
+		}
+	}
+	return toDeauth
+}
+
+func (mod *WiFiModule) deauthCompleter(prefix string) []string {
+	return mod.wifiTargetCompleter(prefix, true)
+}
+
+func (mod *WiFiModule) startDeauth(target string) error {
+	selector, err := newWiFiSelector(target)
+	if err != nil {
 		return err
-	} else if macs, err := network.ParseMACs(deauthSkip); err != nil {
+	}
+
+	// parse skip list
+	if deauthSkip, err := mod.parseWiFiSkipList("wifi.deauth.skip"); err != nil {
 		return err
 	} else {
-		mod.deauthSkip = macs
+		mod.deauthSkip = deauthSkip
 	}
 
 	// if not already running, temporarily enable the pcap handle
@@ -83,31 +95,13 @@ func (mod *WiFiModule) startDeauth(to net.HardwareAddr) error {
 		defer mod.handle.Close()
 	}
 
-	type flow struct {
-		Ap     *network.AccessPoint
-		Client *network.Station
-	}
-
-	toDeauth := make([]flow, 0)
-	isBcast := network.IsBroadcastMac(to)
-	for _, ap := range mod.Session.WiFi.List() {
-		isAP := bytes.Equal(ap.HW, to)
-		for _, client := range ap.Clients() {
-			if isBcast || isAP || bytes.Equal(client.HW, to) {
-				if !mod.skipDeauth(ap.HW) && !mod.skipDeauth(client.HW) {
-					toDeauth = append(toDeauth, flow{Ap: ap, Client: client})
-				} else {
-					mod.Debug("skipping ap:%v client:%v because skip list %v", ap, client, mod.deauthSkip)
-				}
-			}
-		}
-	}
+	toDeauth := mod.deauthFlowsFor(selector)
 
 	if len(toDeauth) == 0 {
-		if isBcast {
+		if selector.all {
 			return nil
 		}
-		return fmt.Errorf("%s is an unknown BSSID, is in the deauth skip list, or doesn't have detected clients.", to.String())
+		return fmt.Errorf("%q is an unknown BSSID, client or ESSID, is in the deauth skip list, or doesn't have detected clients", selector.raw)
 	}
 
 	mod.writes.Add(1)
@@ -118,28 +112,30 @@ func (mod *WiFiModule) startDeauth(to net.HardwareAddr) error {
 		// deauth packet, let's sort by channel so we do the minimum
 		// amount of hops possible
 		sort.Slice(toDeauth, func(i, j int) bool {
-			return toDeauth[i].Ap.Channel < toDeauth[j].Ap.Channel
+			return toDeauth[i].apSnapshot.Channel < toDeauth[j].apSnapshot.Channel
 		})
 
 		// send the deauth frames
 		for _, deauth := range toDeauth {
-			client := deauth.Client
-			ap := deauth.Ap
+			client := deauth.client
+			ap := deauth.ap
+			apSnapshot := deauth.apSnapshot
+			clientSnapshot := deauth.clientSnapshot
 			if mod.Running() {
 				logger := mod.Info
 				if mod.isDeauthSilent() {
 					logger = mod.Debug
 				}
 
-				if ap.IsOpen() && !mod.doDeauthOpen() {
-					mod.Debug("skipping deauth for open network %s (wifi.deauth.open is false)", ap.ESSID())
+				if (apSnapshot.Encryption == "" || apSnapshot.Encryption == "OPEN") && !mod.doDeauthOpen() {
+					mod.Debug("skipping deauth for open network %s (wifi.deauth.open is false)", apSnapshot.Hostname)
 				} else if ap.HasKeyMaterial() && !mod.doDeauthAcquired() {
-					mod.Debug("skipping deauth for AP %s (key material already acquired)", ap.ESSID())
+					mod.Debug("skipping deauth for AP %s (key material already acquired)", apSnapshot.Hostname)
 				} else {
-					logger("deauthing client %s from AP %s (channel:%d encryption:%s)", client.String(), ap.ESSID(), ap.Channel, ap.Encryption)
+					logger("deauthing client %s from AP %s (channel:%d encryption:%s)", client.String(), apSnapshot.Hostname, apSnapshot.Channel, apSnapshot.Encryption)
 
-					mod.onChannel(ap.Channel, func() {
-						mod.sendDeauthPacket(ap.HW, client.HW)
+					mod.onChannel(apSnapshot.Channel, func() {
+						mod.sendDeauthPacket(apSnapshot.HW, clientSnapshot.HW)
 					})
 				}
 			}

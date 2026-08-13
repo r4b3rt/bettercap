@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/bettercap/bettercap/v2/core"
 )
 
 type Meta struct {
@@ -32,6 +32,20 @@ func (m *Meta) MarshalJSON() ([]byte, error) {
 	m.Lock()
 	defer m.Unlock()
 	return json.Marshal(metaJSON{Values: m.m})
+}
+
+func (m *Meta) UnmarshalJSON(raw []byte) error {
+	var doc metaJSON
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	if doc.Values == nil {
+		doc.Values = make(map[string]interface{})
+	}
+	m.Lock()
+	m.m = doc.Values
+	m.Unlock()
+	return nil
 }
 
 func (m *Meta) Set(name string, value interface{}) {
@@ -96,4 +110,22 @@ func (m *Meta) Empty() bool {
 	m.Lock()
 	defer m.Unlock()
 	return len(m.m) == 0
+}
+
+func (m *Meta) MergeDifferentFields(other *Meta) []string {
+	m.Lock()
+	defer m.Unlock()
+
+	updated := []string{}
+
+	if m.m != nil && other.m != nil {
+		for k, v := range other.m {
+			if m.m[k] != v {
+				m.m[k] = v
+				updated = append(updated, k)
+			}
+		}
+	}
+
+	return updated
 }

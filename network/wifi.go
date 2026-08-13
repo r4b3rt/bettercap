@@ -6,38 +6,65 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 
 	"github.com/evilsocket/islazy/data"
-	"github.com/evilsocket/islazy/fs"
 )
 
 func Dot11Freq2Chan(freq int) int {
-	if freq <= 2472 {
+	switch {
+	case freq <= 2472:
 		return ((freq - 2412) / 5) + 1
-	} else if freq == 2484 {
+
+	case freq == 2484:
 		return 14
-	} else if freq >= 5035 && freq <= 5865 {
+
+	case freq >= 5035 && freq <= 5865:
 		return ((freq - 5035) / 5) + 7
-	} else if freq >= 5875 && freq <= 5895 {
+
+	case freq >= 5875 && freq <= 5895:
 		return 177
+
+	case freq >= 5955 && freq <= 7115: // 6GHz
+		return ((freq - 5955) / 5) + 1
 	}
+
 	return 0
+}
+
+var dot11Channel5GHz = map[int]struct{}{
+	36: {}, 40: {}, 44: {}, 48: {},
+	52: {}, 56: {}, 60: {}, 64: {},
+
+	68: {}, 72: {}, 76: {}, 80: {},
+	100: {}, 104: {}, 108: {}, 112: {},
+
+	116: {}, 120: {}, 124: {}, 128: {},
+	132: {}, 136: {}, 140: {}, 144: {},
+
+	149: {}, 153: {}, 157: {}, 161: {},
+	165: {}, 169: {}, 173: {}, 177: {},
 }
 
 func Dot11Chan2Freq(channel int) int {
 	if channel <= 13 {
 		return ((channel - 1) * 5) + 2412
-	} else if channel == 14 {
+	}
+
+	if channel == 14 {
 		return 2484
-	} else if channel <= 173 {
+	}
+
+	if _, ok := dot11Channel5GHz[channel]; ok {
 		return ((channel - 7) * 5) + 5035
-	} else if channel == 177 {
-		return 5885
+	}
+
+	// 6GHz - Skipped 1-13 to avoid 2Ghz channels conflict
+	if channel >= 17 && channel <= 253 {
+		return ((channel - 1) * 5) + 5955
 	}
 
 	return 0
@@ -47,7 +74,7 @@ type APNewCallback func(ap *AccessPoint)
 type APLostCallback func(ap *AccessPoint)
 
 type WiFi struct {
-	sync.RWMutex
+	mu sync.RWMutex
 
 	aliases *data.UnsortedKV
 	aps     map[string]*AccessPoint
@@ -71,61 +98,57 @@ func NewWiFi(iface *Endpoint, aliases *data.UnsortedKV, newcb APNewCallback, los
 }
 
 func (w *WiFi) MarshalJSON() ([]byte, error) {
-
 	doc := wifiJSON{
-		// we know the length so preallocate to reduce memory allocations
-		AccessPoints: make([]*AccessPoint, 0, len(w.aps)),
+		AccessPoints: w.List(),
 	}
-
-	for _, ap := range w.aps {
-		doc.AccessPoints = append(doc.AccessPoints, ap)
-	}
-
 	return json.Marshal(doc)
 }
 
 func (w *WiFi) EachAccessPoint(cb func(mac string, ap *AccessPoint)) {
-	w.Lock()
-	defer w.Unlock()
-
+	type entry struct {
+		mac string
+		ap  *AccessPoint
+	}
+	w.mu.RLock()
+	entries := make([]entry, 0, len(w.aps))
 	for m, ap := range w.aps {
-		cb(m, ap)
+		entries = append(entries, entry{mac: m, ap: ap})
+	}
+	w.mu.RUnlock()
+	for _, item := range entries {
+		cb(item.mac, item.ap)
 	}
 }
 
 func (w *WiFi) Stations() (list []*Station) {
-	w.RLock()
-	defer w.RUnlock()
-
+	w.mu.RLock()
 	list = make([]*Station, 0, len(w.aps))
-
 	for _, ap := range w.aps {
-		list = append(list, ap.Station)
+		list = append(list, ap.Station())
 	}
+	w.mu.RUnlock()
 	return
 }
 
 func (w *WiFi) List() (list []*AccessPoint) {
-	w.RLock()
-	defer w.RUnlock()
-
+	w.mu.RLock()
 	list = make([]*AccessPoint, 0, len(w.aps))
-
 	for _, ap := range w.aps {
 		list = append(list, ap)
 	}
+	w.mu.RUnlock()
 	return
 }
 
 func (w *WiFi) Remove(mac string) {
-	w.Lock()
-	defer w.Unlock()
-
-	if ap, found := w.aps[mac]; found {
+	w.mu.Lock()
+	ap, found := w.aps[mac]
+	if found {
 		delete(w.aps, mac)
-		if w.lostCb != nil {
-			w.lostCb(ap)
-		}
+	}
+	w.mu.Unlock()
+	if found && w.lostCb != nil {
+		w.lostCb(ap)
 	}
 }
 
@@ -142,53 +165,44 @@ func isBogusMacESSID(essid string) bool {
 }
 
 func (w *WiFi) AddIfNew(ssid, mac string, frequency int, rssi int8) (*AccessPoint, bool) {
-	w.Lock()
-	defer w.Unlock()
-
 	mac = NormalizeMac(mac)
 	alias := w.aliases.GetOr(mac, "")
-	if ap, found := w.aps[mac]; found {
-		ap.LastSeen = time.Now()
-		if rssi != 0 {
-			ap.RSSI = rssi
-		}
-		// always get the cleanest one
-		if !isBogusMacESSID(ssid) {
-			ap.Hostname = ssid
-		}
-
-		if alias != "" {
-			ap.Alias = alias
-		}
+	w.mu.RLock()
+	ap, found := w.aps[mac]
+	w.mu.RUnlock()
+	if found {
+		ap.Station().updateAccessPoint(ssid, rssi, alias)
 		return ap, false
 	}
 
-	newAp := NewAccessPoint(ssid, mac, frequency, rssi, w.aliases)
-	newAp.Alias = alias
-	w.aps[mac] = newAp
+	candidate := NewAccessPoint(ssid, mac, frequency, rssi, w.aliases)
+	candidate.SetAlias(alias)
 
-	if w.newCb != nil {
-		w.newCb(newAp)
+	w.mu.Lock()
+	if ap, found = w.aps[mac]; found {
+		w.mu.Unlock()
+		ap.Station().updateAccessPoint(ssid, rssi, alias)
+		return ap, false
 	}
-
-	return newAp, true
+	w.aps[mac] = candidate
+	w.mu.Unlock()
+	if w.newCb != nil {
+		w.newCb(candidate)
+	}
+	return candidate, true
 }
 
 func (w *WiFi) Get(mac string) (*AccessPoint, bool) {
-	w.RLock()
-	defer w.RUnlock()
-
 	mac = NormalizeMac(mac)
+	w.mu.RLock()
 	ap, found := w.aps[mac]
+	w.mu.RUnlock()
 	return ap, found
 }
 
 func (w *WiFi) GetClient(mac string) (*Station, bool) {
-	w.RLock()
-	defer w.RUnlock()
-
 	mac = NormalizeMac(mac)
-	for _, ap := range w.aps {
+	for _, ap := range w.List() {
 		if client, found := ap.Get(mac); found {
 			return client, true
 		}
@@ -198,19 +212,23 @@ func (w *WiFi) GetClient(mac string) (*Station, bool) {
 }
 
 func (w *WiFi) Clear() {
-	w.Lock()
-	defer w.Unlock()
+	w.mu.Lock()
 	w.aps = make(map[string]*AccessPoint)
+	w.mu.Unlock()
+}
+
+func (w *WiFi) NumAPs() int {
+	w.mu.RLock()
+	n := len(w.aps)
+	w.mu.RUnlock()
+	return n
 }
 
 func (w *WiFi) NumHandshakes() int {
-	w.RLock()
-	defer w.RUnlock()
-
 	sum := 0
-	for _, ap := range w.aps {
+	for _, ap := range w.List() {
 		for _, station := range ap.Clients() {
-			if station.Handshake.Complete() {
+			if station.Handshake().Complete() {
 				sum++
 			}
 		}
@@ -228,32 +246,30 @@ func (w *WiFi) SaveHandshakesTo(fileName string, linkType layers.LinkType) error
 		}
 	}
 
-	doHead := !fs.Exists(fileName)
 	fp, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return err
 	}
 	defer fp.Close()
 
-	writer := pcapgo.NewWriter(fp)
-
-	if doHead {
-		if err = writer.WriteFileHeader(65536, linkType); err != nil {
-			return err
-		}
+	writer, err := pcapgo.NewNgWriter(fp, linkType)
+	if err != nil {
+		return err
 	}
 
-	w.RLock()
-	defer w.RUnlock()
+	defer writer.Flush()
 
-	for _, ap := range w.aps {
+	for _, ap := range w.List() {
 		for _, station := range ap.Clients() {
 			// if half (which includes also complete) or has pmkid
-			if station.Handshake.Any() {
+			handshake := station.Handshake()
+			if handshake.Any() {
 				err = nil
-				station.Handshake.EachUnsavedPacket(func(pkt gopacket.Packet) {
+				handshake.EachUnsavedPacket(func(pkt gopacket.Packet) {
 					if err == nil {
-						err = writer.WritePacket(pkt.Metadata().CaptureInfo, pkt.Data())
+						ci := pkt.Metadata().CaptureInfo
+						ci.InterfaceIndex = 0
+						err = writer.WritePacket(ci, pkt.Data())
 					}
 				})
 				if err != nil {

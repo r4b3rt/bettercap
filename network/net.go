@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/bettercap/bettercap/v2/core"
 
 	"github.com/evilsocket/islazy/data"
 	"github.com/evilsocket/islazy/str"
@@ -41,7 +41,7 @@ var (
 		`(?:25[0-5]|2[0-4][0-9]|[1][0-9]{2}|[1-9]?[0-9])` + `$`)
 	MACValidator = regexp.MustCompile(`(?i)^(?:[a-f0-9]{2}:){5}[a-f0-9]{2}$`)
 	// lulz this sounds like a hamburger
-	macParser   = regexp.MustCompile(`(?i)((?:[a-f0-9]{2}:){5}[a-f0-9]{2})`)
+	macParser   = regexp.MustCompile(`(?i)((?:[a-f0-9]{2}[:-]){5}[a-f0-9]{2})`)
 	aliasParser = regexp.MustCompile(`(?i)([a-z_][a-z_0-9]+)`)
 )
 
@@ -196,16 +196,12 @@ func buildEndpointFromInterface(iface net.Interface) (*Endpoint, error) {
 
 	for _, a := range addrs {
 		address := a.String()
-		switch true {
-		case IPv4Validator.MatchString(address):
+		if IPv4Validator.MatchString(address) {
 			e.SetIP(address)
-			break
-		case IPv4BlockValidator.MatchString(address):
+		} else if IPv4BlockValidator.MatchString(address) {
 			e.SetNetwork(address)
-			break
-		default:
+		} else {
 			e.SetIPv6(address)
-			break
 		}
 	}
 
@@ -256,6 +252,11 @@ func FindInterface(name string) (*Endpoint, error) {
 	// return the first one with a valid ipv4
 	// address that does not loop back
 	for _, iface := range ifaces {
+		// if name has not been provided, avoid default to a tun interface
+		if strings.Contains(iface.Name, "tun") {
+			continue
+		}
+
 		addrs, err := iface.Addrs()
 		if err != nil {
 			fmt.Printf("wtf of the day: %s", err)

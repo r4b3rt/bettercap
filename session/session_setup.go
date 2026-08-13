@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bettercap/bettercap/caplets"
+	"github.com/bettercap/bettercap/v2/caplets"
 
 	"github.com/bettercap/readline"
 
@@ -71,8 +71,12 @@ func (s *Session) setupReadline() (err error) {
 	}
 
 	history := ""
-	if !*s.Options.NoHistory {
-		history, _ = fs.Expand(HistoryFile)
+	if !s.Options.NoHistory {
+		histPath := DefaultHistoryFile
+		if fromEnv := os.Getenv(HistoryEnvVar); fromEnv != "" {
+			histPath = fromEnv
+		}
+		history, _ = fs.Expand(histPath)
 	}
 
 	cfg := readline.Config{
@@ -114,7 +118,7 @@ func (s *Session) startNetMon() {
 }
 
 func (s *Session) setupSignals() {
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
@@ -143,7 +147,7 @@ func (s *Session) setupEnv() {
 	}
 
 	dbg := "false"
-	if *s.Options.Debug {
+	if s.Options.Debug {
 		dbg = "true"
 	}
 	s.Env.WithCallback("log.debug", dbg, func(newValue string) {
@@ -155,7 +159,7 @@ func (s *Session) setupEnv() {
 	})
 
 	silent := "false"
-	if *s.Options.Silent {
+	if s.Options.Silent {
 		silent = "true"
 	}
 	s.Env.WithCallback("log.silent", silent, func(newValue string) {

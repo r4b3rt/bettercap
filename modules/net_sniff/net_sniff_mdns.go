@@ -4,11 +4,11 @@ import (
 	"net"
 	"strings"
 
-	"github.com/bettercap/bettercap/packets"
-	"github.com/bettercap/bettercap/session"
+	"github.com/bettercap/bettercap/v2/packets"
+	"github.com/bettercap/bettercap/v2/session"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 
 	"github.com/evilsocket/islazy/tui"
 )

@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bettercap/bettercap/caplets"
-	"github.com/bettercap/bettercap/modules/wifi"
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/session"
+	"github.com/bettercap/bettercap/v2/caplets"
+	"github.com/bettercap/bettercap/v2/modules/wifi"
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/session"
 	"github.com/evilsocket/islazy/fs"
 	"github.com/evilsocket/islazy/plugin"
 	"github.com/evilsocket/islazy/str"
@@ -285,16 +285,11 @@ func (mod *Module) onEvent(e session.Event) {
 		}
 	} else if e.Tag == "wifi.client.probe" {
 		probe := e.Data.(wifi.ProbeEvent)
-		station := network.Station{
-			RSSI: probe.RSSI,
-			Endpoint: &network.Endpoint{
-				HwAddress: probe.FromAddr,
-				Vendor:    probe.FromVendor,
-				Alias:     probe.FromAlias,
-			},
-		}
+		station := network.NewStation("", probe.FromAddr, 0, probe.RSSI)
+		station.SetVendor(probe.FromVendor)
+		station.SetAlias(probe.FromAlias)
 
-		if _, _, staEntity, _, err := mod.createDot11ProbeGraph(probe.SSID, &station); err != nil {
+		if _, _, staEntity, _, err := mod.createDot11ProbeGraph(probe.SSID, station); err != nil {
 			mod.Error("%s", err)
 		} else {
 			// don't add fake ap to entities, no need to correlate

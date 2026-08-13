@@ -14,11 +14,12 @@ import (
 
 	"github.com/bettercap/readline"
 
-	"github.com/bettercap/bettercap/caplets"
-	"github.com/bettercap/bettercap/core"
-	"github.com/bettercap/bettercap/firewall"
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/packets"
+	"github.com/bettercap/bettercap/v2/caplets"
+	"github.com/bettercap/bettercap/v2/core"
+	"github.com/bettercap/bettercap/v2/firewall"
+	my_log "github.com/bettercap/bettercap/v2/log"
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/packets"
 
 	"github.com/evilsocket/islazy/data"
 	"github.com/evilsocket/islazy/fs"
@@ -30,7 +31,8 @@ import (
 )
 
 const (
-	HistoryFile = "~/bettercap.history"
+	DefaultHistoryFile = "~/bettercap.history"
+	HistoryEnvVar      = "BETTERCAP_HISTORY"
 )
 
 var (
@@ -76,6 +78,7 @@ type Session struct {
 	WiFi      *network.WiFi
 	BLE       *network.BLE
 	HID       *network.HID
+	CAN       *network.CAN
 	Queue     *packets.Queue
 	StartedAt time.Time
 	Active    bool
@@ -94,18 +97,13 @@ type Session struct {
 	script *Script
 }
 
-func New() (*Session, error) {
-	opts, err := core.ParseOptions()
-	if err != nil {
-		return nil, err
-	}
-
-	if *opts.NoColors || !tui.Effects() {
+func WithOptions(opts core.Options) (s *Session, err error) {
+	if opts.NoColors || !tui.Effects() {
 		tui.Disable()
 		log.NoEffects = true
 	}
 
-	s := &Session{
+	s = &Session{
 		Prompt:  NewPrompt(),
 		Options: opts,
 		Env:     nil,
@@ -119,22 +117,22 @@ func New() (*Session, error) {
 		UnkCmdCallback:   nil,
 	}
 
-	if *s.Options.CpuProfile != "" {
-		f, err := os.Create(*s.Options.CpuProfile)
+	if s.Options.CpuProfile != "" {
+		f, err := os.Create(s.Options.CpuProfile)
 		if err != nil {
 			return nil, err
 		}
-		defer  f.Close()
+		defer f.Close()
 		if err := pprof.StartCPUProfile(f); err != nil {
 			return nil, err
 		}
 	}
 
-	if bufSize := *s.Options.PcapBufSize; bufSize != -1 {
+	if bufSize := s.Options.PcapBufSize; bufSize != -1 {
 		network.CAPTURE_DEFAULTS.Bufsize = bufSize
 	}
 
-	if s.Env, err = NewEnvironment(*s.Options.EnvFile); err != nil {
+	if s.Env, err = NewEnvironment(s.Options.EnvFile); err != nil {
 		return nil, err
 	}
 
@@ -142,27 +140,35 @@ func New() (*Session, error) {
 		return nil, err
 	}
 
-	s.Events = NewEventPool(*s.Options.Debug, *s.Options.Silent)
+	s.Events = NewEventPool(s.Options.Debug, s.Options.Silent)
 
 	s.registerCoreHandlers()
 
 	if I == nil {
 		I = s
+		my_log.Logger = s.Events.Log
 	}
 
 	return s, nil
 }
 
+func New() (*Session, error) {
+	opts, err := core.ParseOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	return WithOptions(opts)
+}
+
 func (s *Session) Lock() {
 	s.Env.Lock()
 	s.Lan.Lock()
-	s.WiFi.Lock()
 }
 
 func (s *Session) Unlock() {
 	s.Env.Unlock()
 	s.Lan.Unlock()
-	s.WiFi.Unlock()
 }
 
 func (s *Session) Module(name string) (err error, mod Module) {
@@ -175,11 +181,11 @@ func (s *Session) Module(name string) (err error, mod Module) {
 }
 
 func (s *Session) Close() {
-	if *s.Options.PrintVersion {
+	if s.Options.PrintVersion {
 		return
 	}
 
-	if *s.Options.Debug {
+	if s.Options.Debug {
 		fmt.Printf("\nStopping modules and cleaning session state ...\n")
 		s.Events.Add("session.closing", nil)
 	}
@@ -190,21 +196,23 @@ func (s *Session) Close() {
 		}
 	}
 
-	s.Firewall.Restore()
+	if s.Firewall != nil {
+		s.Firewall.Restore()
+	}
 
-	if *s.Options.EnvFile != "" {
-		envFile, _ := fs.Expand(*s.Options.EnvFile)
+	if s.Options.EnvFile != "" {
+		envFile, _ := fs.Expand(s.Options.EnvFile)
 		if err := s.Env.Save(envFile); err != nil {
 			fmt.Printf("error while storing the environment to %s: %s", envFile, err)
 		}
 	}
 
-	if *s.Options.CpuProfile != "" {
+	if s.Options.CpuProfile != "" {
 		pprof.StopCPUProfile()
 	}
 
-	if *s.Options.MemProfile != "" {
-		f, err := os.Create(*s.Options.MemProfile)
+	if s.Options.MemProfile != "" {
+		f, err := os.Create(s.Options.MemProfile)
 		if err != nil {
 			fmt.Printf("could not create memory profile: %s\n", err)
 			return
@@ -234,13 +242,13 @@ func (s *Session) Start() error {
 		return s.Modules[i].Name() < s.Modules[j].Name()
 	})
 
-	if *s.Options.CapletsPath != "" {
-		if err = caplets.Setup(*s.Options.CapletsPath); err != nil {
+	if s.Options.CapletsPath != "" {
+		if err = caplets.Setup(s.Options.CapletsPath); err != nil {
 			return err
 		}
 	}
 
-	if s.Interface, err = network.FindInterface(*s.Options.InterfaceName); err != nil {
+	if s.Interface, err = network.FindInterface(s.Options.InterfaceName); err != nil {
 		return err
 	}
 
@@ -248,8 +256,8 @@ func (s *Session) Start() error {
 		return err
 	}
 
-	if *s.Options.Gateway != "" {
-		if s.Gateway, err = network.GatewayProvidedByUser(s.Interface, *s.Options.Gateway); err != nil {
+	if s.Options.Gateway != "" {
+		if s.Gateway, err = network.GatewayProvidedByUser(s.Interface, s.Options.Gateway); err != nil {
 			s.Events.Log(log.WARNING, "%s", err.Error())
 			s.Gateway, err = network.FindGateway(s.Interface)
 		}
@@ -271,6 +279,12 @@ func (s *Session) Start() error {
 	}
 
 	s.Firewall = firewall.Make(s.Interface)
+
+	s.CAN = network.NewCAN(s.Aliases, func(dev *network.CANDevice) {
+		s.Events.Add("can.device.new", dev)
+	}, func(dev *network.CANDevice) {
+		s.Events.Add("can.device.lost", dev)
+	})
 
 	s.HID = network.NewHID(s.Aliases, func(dev *network.HIDDevice) {
 		s.Events.Add("hid.device.new", dev)
@@ -318,15 +332,17 @@ func (s *Session) Start() error {
 	plugin.Defines["fileExists"] = jsFileExistsFunc
 	plugin.Defines["loadJSON"] = jsLoadJSONFunc
 	plugin.Defines["saveJSON"] = jsSaveJSONFunc
+	plugin.Defines["saveToFile"] = jsSaveToFileFunc
 	plugin.Defines["onEvent"] = jsOnEventFunc
+	plugin.Defines["removeEventListener"] = jsRemoveEventListenerFunc
 	plugin.Defines["session"] = s
 
 	// load the script here so the session and its internal objects are ready
-	if *s.Options.Script != "" {
-		if s.script, err = LoadScript(*s.Options.Script); err != nil {
-			return fmt.Errorf("error loading %s: %v", *s.Options.Script, err)
+	if s.Options.Script != "" {
+		if s.script, err = LoadScript(s.Options.Script); err != nil {
+			return fmt.Errorf("error loading %s: %v", s.Options.Script, err)
 		}
-		log.Debug("session script %s loaded", *s.Options.Script)
+		log.Debug("session script %s loaded", s.Options.Script)
 	}
 
 	return nil
@@ -450,10 +466,18 @@ func (s *Session) Run(line string) error {
 	}
 
 	// is it a module command?
-	for _, m := range s.Modules {
-		for _, h := range m.Handlers() {
-			if parsed, args := h.Parse(line); parsed {
-				return h.Exec(args)
+	for _, mod := range s.Modules {
+		for _, modHandler := range mod.Handlers() {
+			if parsed, args := modHandler.Parse(line); parsed {
+				if err := modHandler.Exec(args); err != nil {
+					return err
+				} else if prompt := mod.Prompt(); prompt != "" {
+					// if the module handler has been executed successfully and
+					// the module overrides the prompt, set it
+					s.Env.Set(PromptVariable, prompt)
+					s.Refresh()
+				}
+				return nil
 			}
 		}
 	}
@@ -470,5 +494,5 @@ func (s *Session) Run(line string) error {
 		return nil
 	}
 
-	return fmt.Errorf("unknown or invalid syntax \"%s%s%s\", type %shelp%s for the help menu.", tui.BOLD, line, tui.RESET, tui.BOLD, tui.RESET)
+	return fmt.Errorf("unknown or invalid syntax \"%s%s%s\", type %shelp%s for the help menu", tui.BOLD, line, tui.RESET, tui.BOLD, tui.RESET)
 }

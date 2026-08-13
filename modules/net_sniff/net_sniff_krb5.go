@@ -4,10 +4,10 @@ import (
 	"encoding/asn1"
 	"net"
 
-	"github.com/bettercap/bettercap/packets"
+	"github.com/bettercap/bettercap/v2/packets"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 
 	"github.com/evilsocket/islazy/tui"
 )

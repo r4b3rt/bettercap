@@ -2,25 +2,27 @@ package events_stream
 
 import (
 	"fmt"
-	"github.com/bettercap/bettercap/modules/wifi"
 	"io"
 	"strings"
 
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/session"
+	"github.com/bettercap/bettercap/v2/modules/wifi"
+
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/session"
 
 	"github.com/evilsocket/islazy/tui"
 )
 
 func (mod *EventsStream) viewWiFiApEvent(output io.Writer, e session.Event) {
 	ap := e.Data.(*network.AccessPoint)
+	snapshot := ap.Snapshot()
 	vend := ""
-	if ap.Vendor != "" {
-		vend = fmt.Sprintf(" (%s)", ap.Vendor)
+	if snapshot.Vendor != "" {
+		vend = fmt.Sprintf(" (%s)", snapshot.Vendor)
 	}
 	rssi := ""
-	if ap.RSSI != 0 {
-		rssi = fmt.Sprintf(" (%d dBm)", ap.RSSI)
+	if snapshot.RSSI != 0 {
+		rssi = fmt.Sprintf(" (%d dBm)", snapshot.RSSI)
 	}
 
 	if e.Tag == "wifi.ap.new" {
@@ -75,8 +77,9 @@ func (mod *EventsStream) viewWiFiHandshakeEvent(output io.Writer, e session.Even
 	what := "handshake"
 
 	if ap, found := mod.Session.WiFi.Get(hand.AP); found {
-		to = fmt.Sprintf("%s (%s)", tui.Bold(ap.ESSID()), tui.Dim(ap.BSSID()))
-		what = fmt.Sprintf("%s handshake", ap.Encryption)
+		snapshot := ap.Snapshot()
+		to = fmt.Sprintf("%s (%s)", tui.Bold(snapshot.Hostname), tui.Dim(snapshot.HwAddress))
+		what = fmt.Sprintf("%s handshake", snapshot.Encryption)
 	}
 
 	if hand.PMKID != nil {
@@ -99,7 +102,7 @@ func (mod *EventsStream) viewWiFiHandshakeEvent(output io.Writer, e session.Even
 func (mod *EventsStream) viewWiFiClientEvent(output io.Writer, e session.Event) {
 	ce := e.Data.(wifi.ClientEvent)
 
-	ce.Client.Alias = mod.Session.Lan.GetAlias(ce.Client.BSSID())
+	ce.Client.SetAlias(mod.Session.Lan.GetAlias(ce.Client.BSSID()))
 
 	if e.Tag == "wifi.client.new" {
 		fmt.Fprintf(output, "[%s] [%s] new station %s detected for %s (%s)\n",
@@ -131,6 +134,16 @@ func (mod *EventsStream) viewWiFiDeauthEvent(output io.Writer, e session.Event) 
 		deauth.RSSI)
 }
 
+func (mod *EventsStream) viewWiFiBruteforceEvent(output io.Writer, e session.Event) {
+	success := e.Data.(wifi.BruteforceSuccess)
+	fmt.Fprintf(output, "[%s] [%s] target='%s' password='%s' auth_in=%v\n",
+		e.Time.Format(mod.timeFormat),
+		tui.Green(tui.Bold(e.Tag)),
+		tui.Bold(success.Target),
+		tui.Bold(success.Password),
+		success.Elapsed)
+}
+
 func (mod *EventsStream) viewWiFiEvent(output io.Writer, e session.Event) {
 	if strings.HasPrefix(e.Tag, "wifi.ap.") {
 		mod.viewWiFiApEvent(output, e)
@@ -142,6 +155,8 @@ func (mod *EventsStream) viewWiFiEvent(output io.Writer, e session.Event) {
 		mod.viewWiFiHandshakeEvent(output, e)
 	} else if e.Tag == "wifi.client.new" || e.Tag == "wifi.client.lost" {
 		mod.viewWiFiClientEvent(output, e)
+	} else if e.Tag == "wifi.bruteforce.success" {
+		mod.viewWiFiBruteforceEvent(output, e)
 	} else {
 		fmt.Fprintf(output, "[%s] [%s] %#v\n", e.Time.Format(mod.timeFormat), tui.Green(e.Tag), e)
 	}

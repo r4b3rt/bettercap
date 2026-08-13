@@ -1,22 +1,22 @@
 package http_proxy
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/bettercap/bettercap/log"
-	"github.com/bettercap/bettercap/modules/dns_spoof"
-	"github.com/bettercap/bettercap/network"
-	"github.com/bettercap/bettercap/session"
+	"github.com/bettercap/bettercap/v2/log"
+	"github.com/bettercap/bettercap/v2/modules/dns_spoof"
+	"github.com/bettercap/bettercap/v2/network"
+	"github.com/bettercap/bettercap/v2/session"
 
 	"github.com/elazarl/goproxy"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
 
 	"github.com/evilsocket/islazy/tui"
 
@@ -163,7 +163,7 @@ func (s *SSLStripper) fixCookiesInHeader(res *http.Response) {
 	origHost := res.Request.URL.Hostname()
 	strippedHost := s.hosts.Strip(origHost /* unstripped */)
 
-	if strippedHost != nil && /*strippedHost.Hostname != origHost && */res.Header["Set-Cookie"] != nil {
+	if strippedHost != nil && /*strippedHost.Hostname != origHost && */ res.Header["Set-Cookie"] != nil {
 		// origHost is being tracked.
 		// get domains from hostnames
 		if origParts, strippedParts := strings.Split(origHost, "."), strings.Split(strippedHost.Hostname, "."); len(origParts) > 1 && len(strippedParts) > 1 {
@@ -253,7 +253,7 @@ func (s *SSLStripper) Process(res *http.Response, ctx *goproxy.ProxyCtx) {
 	// if we have a text or html content type, fetch the body
 	// and perform sslstripping
 	if s.isContentStrippable(res) {
-		raw, err := ioutil.ReadAll(res.Body)
+		raw, err := io.ReadAll(res.Body)
 		if err != nil {
 			log.Error("Could not read response body: %s", err)
 			return
@@ -297,9 +297,9 @@ func (s *SSLStripper) Process(res *http.Response, ctx *goproxy.ProxyCtx) {
 
 		// reset the response body to the original unread state
 		// but with just a string reader, this way further calls
-		// to ioutil.ReadAll(res.Body) will just return the content
+		// to ui.ReadAll(res.Body) will just return the content
 		// we stripped without downloading anything again.
-		res.Body = ioutil.NopCloser(strings.NewReader(body))
+		res.Body = io.NopCloser(strings.NewReader(body))
 	}
 
 	// fix cookies domain + strip "secure" + "httponly" flags
